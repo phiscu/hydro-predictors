@@ -7,8 +7,15 @@ import requests
 import glob
 import zipfile
 import rasterio
+import xarray as xr
+import requests
+from datetime import date
+import rioxarray
+import xee
 from rasterio.merge import merge
 from rasterio.mask import mask
+from dask.diagnostics import ProgressBar
+
 # To avoid PROJ error:
 os.environ['PROJ_LIB'] = pyproj.datadir.get_data_dir()
 
@@ -16,16 +23,15 @@ os.environ['PROJ_LIB'] = pyproj.datadir.get_data_dir()
 ee.Initialize(project="matilda-edu")
 
 # 1. Load local catchments from a GeoPackage and convert to EE FeatureCollection
-# Replace 'catchments.gpkg' and 'your_layer_name' with your file and layer
 gdf = gpd.read_file('/home/phillip/Seafile/EBA-CA/Papers/No3_Issyk-Kul/geodata/issykul_vectors.gpkg', layer='catchment_new')
 catchments = geemap.geopandas_to_ee(gdf)
 
 # Define regions
 def get_region_catch():
-    return catchments.geometry().getInfo()
+    return catchments.geometry()
 
 def get_region_bbox():
-    return catchments.geometry().bounds().getInfo()
+    return catchments.geometry().bounds()
 
 region_catch = get_region_catch()
 region_bbox = get_region_bbox()
@@ -139,6 +145,167 @@ def stitch_and_clip(zip_pattern, out_mosaic, out_clipped, clip_gdf):
         dst.write(out_img)
     print(f"Stitched and clipped {out_clipped}")
 
+## 4. MERIT Hydro DEM (~90 m)
+
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+def get_image_from_config(cfg):
+    """
+    cfg: ['Image'|'ImageCollection', asset_id, band, name]
+    Returns an ee.Image with the selected band.
+    """
+    kind, asset_id, band, *_ = cfg
+    if kind == 'Image':
+        return ee.Image(asset_id).select(band)
+    elif kind == 'ImageCollection':
+        return ee.ImageCollection(asset_id).select(band).mosaic()
+    else:
+        raise ValueError(f"Unknown kind: {kind}")
+
+def build_box_from_point(lon, lat, buffer_m=40_000):
+    """Buffered box around a point (like your notebook)."""
+    pt = ee.Geometry.Point(lon, lat)
+    return pt.buffer(buffer_m).bounds()
+
+# ------------------------------------------------------------------
+# Main downloader using xarray (fallback to geemap.ee_export_image)
+# ------------------------------------------------------------------
+def download_dem(dem_config, region_geom, out_path, scale=30, scale_factor=1):
+    """
+    dem_config: ['Image'|'ImageCollection', asset_id, band, name]
+    region_geom: ee.Geometry
+    out_path: output GeoTIFF path
+    scale: pixel size for fallback export
+    scale_factor: multiply the DEM values by this factor before export
+                  (use 1000 for MERIT/DEM if your values are in km)
+    """
+    img = get_image_from_config(dem_config)
+
+    # --- apply unit scaling here (affects BOTH xarray and geemap paths) ---
+    if scale_factor != 1:
+        img = img.multiply(scale_factor).toFloat().rename(f"{dem_config[2]}_scaled")
+
+    img = img.clip(region_geom)    # clip to basin geometry
+
+    try:
+        ic = ee.ImageCollection(img)
+        ds = xr.open_dataset(
+            ic,
+            engine="ee",
+            projection=img.projection(),
+            geometry=region_geom,
+        )
+        ds_t = ds.isel(time=0).drop_vars("time").transpose()
+        ds_t.rio.set_spatial_dims("lon", "lat", inplace=True)
+        ds_t.rio.to_raster(out_path)
+        print(f"DEM saved (xarray path): {out_path}")
+
+    except Exception as e:
+        print(f"xarray path failed ({e}). Falling back to geemap.ee_export_image...")
+        geemap.ee_export_image(
+            img, filename=out_path, scale=scale, region=region_geom, file_per_band=False
+        )
+        print(f"DEM saved (geemap path): {out_path}")
+
+# ------------------------------------------------------------------
+
+dem_config = ['Image', 'MERIT/DEM/v1_0_3', 'dem', 'MERIT 30m']
+dem_file = '/home/phillip/Seafile/EBA-CA/Papers/No3_Issyk-Kul/geodata/predictors/MERIT_DEM/MERIT30_dem.tif'
+download_dem(dem_config, region_catch, dem_file, scale=30, scale_factor=1000)  # scale_factor=1000 for MERIT DEM in m
+
+
+## 5. ERA5-Land daily temperature
+
+def download_era5l_t2(catchments,
+                      start="2000-01-01",
+                      end="2024-12-31",
+                      units="C",            # "C" or "K"
+                      fmt="netcdf",         # "netcdf" or "zarr"
+                      path="ERA5L_t2m.nc",
+                      time_chunks=365,
+                      buffer_m=10000,       # buffer in meters
+                      clip_to_buffer=True,
+                      use_bbox=True):
+
+    # --- Build buffered bbox geometry ---
+    base_geom = catchments.geometry().bounds() if use_bbox else catchments.geometry()
+    buf_geom = base_geom.buffer(buffer_m) if buffer_m and buffer_m > 0 else base_geom
+    open_geom = buf_geom.bounds() if use_bbox else buf_geom
+
+    # --- ERA5-Land collection ---
+    col0 = (ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR")
+              .select("temperature_2m")
+              .filterDate(ee.Date(start), ee.Date(end)))
+
+    def prep(im):
+        im2 = im.subtract(273.15) if units.upper() == "C" else im
+        im2 = im2.rename("t2m")
+        if clip_to_buffer:
+            im2 = im2.clip(buf_geom)
+        return im2.copyProperties(im, ["system:time_start", "system:time_end"])
+
+    col = col0.map(prep)
+    proj = ee.Image(col.first()).projection()
+
+    # --- Open as xarray Dataset ---
+    ds = xr.open_dataset(col, engine="ee", projection=proj, geometry=open_geom)
+
+    # --- Rename dims to (time, lat, lon) ---
+    ren = {}
+    if "y" in ds.dims: ren["y"] = "lat"
+    if "x" in ds.dims: ren["x"] = "lon"
+    if ren: ds = ds.rename(ren)
+    ds = ds.transpose("time", "lat", "lon")
+
+    # --- Safe rechunk ---
+    T, Y, L = ds.sizes["time"], ds.sizes["lat"], ds.sizes["lon"]
+    ds = ds.chunk({"time": min(time_chunks, T),
+                   "lat": min(256, Y),
+                   "lon": min(256, L)})
+
+    # --- Set attributes ---
+    var = "t2m"
+    ds[var] = ds[var].astype("float32")
+    ds[var].attrs.update({
+        "long_name": "2m air temperature (daily aggregated)",
+        "units": "degC" if units.upper() == "C" else "K",
+        "source": "ECMWF ERA5-Land Daily Aggregated (GEE: ECMWF/ERA5_LAND/DAILY_AGGR)"
+    })
+
+    # --- Export with progress bar ---
+    with ProgressBar():
+        if fmt.lower() == "netcdf":
+            enc = {var: {"zlib": True, "complevel": 4, "shuffle": True,
+                         "dtype": "float32",
+                         "chunksizes": (min(time_chunks, T), min(256, Y), min(256, L))}}
+            ds.to_netcdf(path, engine="netcdf4", encoding=enc)
+        else:
+            try:
+                import numcodecs
+                compressor = numcodecs.Blosc(cname="zstd", clevel=4,
+                                             shuffle=numcodecs.Blosc.SHUFFLE)
+                enc = {var: {"compressor": compressor, "dtype": "float32",
+                             "chunks": (min(time_chunks, T), min(256, Y), min(256, L))}}
+            except Exception:
+                enc = {var: {"dtype": "float32",
+                             "chunks": (min(time_chunks, T), min(256, Y), min(256, L))}}
+            ds.to_zarr(path, mode="w", consolidated=True, encoding=enc)
+
+    return path
+
+era5_nc = download_era5l_t2(
+    catchments,
+    start="1999-01-01",
+    end="2018-12-31",
+    units="C",
+    fmt="netcdf",
+    path="ERA5L_t2m_1999_2018_bbox.nc",
+    time_chunks=365,
+    buffer_m=15000,        # e.g., 15 km buffer
+    clip_to_buffer=True,   # clip to buffered bbox so edges are included
+    use_bbox=True          # keep rectangular window for stability
+)
 
 ## IDE execution
 
@@ -148,10 +315,20 @@ def stitch_and_clip(zip_pattern, out_mosaic, out_clipped, clip_gdf):
 # # Stitch 5-year GLC
 # stitch_and_clip('GLC_5yr_*_tile_*.zip', 'GLC_5yr_mosaic.tif', 'GLC_5yr_clipped.tif', gdf)
 
-
 ##
 if __name__ == '__main__':
     download_modis_et()
+    download_dem(dem_config, region_catch, dem_file, scale=30,
+                 scale_factor=1000)
+    era5_nc = download_era5l_t2(
+        catchments,
+        start="1999-01-01",
+        end="2018-12-31",
+        units="C",
+        fmt="netcdf",
+        path="ERA5L_t2m_1999_2018.nc",
+        time_chunks=365
+    )
     download_soil_hsg()
     download_glc()
     # Stitch annual GLC
